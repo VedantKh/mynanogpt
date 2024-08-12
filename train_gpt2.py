@@ -193,6 +193,35 @@ class GPT(nn.Module):
         return logits, loss
 
 # -------------------------------------------------------
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T)  # inputs
+        y = (buf[1:]).view(B, T)  # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+        
 # attempt to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
@@ -210,15 +239,26 @@ text = text[:1000] # only use the first 1000 characters
 tokens = enc.encode(text)
 B, T = 4, 32
 buf = torch.tensor(tokens[:B*T + 1])
+buf = buf.to(device)
 x = buf[:-1].view(B, T) # (B, T)
 y = buf[1:].view(B, T) # (B, T)
 
 # get logits
-
-# model = GPT.from_pretrained('gpt2')
+# model = GPT.from_pretrained('gpt2') # OR
 model = GPT(GPTConfig())
 model.to(device)
 logits, loss = model(x, y) # model(x)
+
+# alternative to stochastic gradient descent that works better
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+# optimize!
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
 
 print(loss) # should be (B, T, vocab_size)
 import sys; sys.exit(0)
@@ -235,7 +275,7 @@ num_return_sequences = 5
 max_length = 30
 
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode('Dost thou enjoy the gentle')
+tokens = enc.encode('First')
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 x = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
 # x = x.to('cuda')
@@ -246,10 +286,8 @@ torch.manual_seed(42)
 while x.size(1) < max_length:
     # forward the model to get the logits
     with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-
-    # take the logits at the last position (inefficient sampling method but it works)
-    next_token_logits = logits[:, -1, :] # (B, vocab_size)
+        logits, _ = model(x)  # Unpack the tuple to get logits
+        next_token_logits = logits[:, -1, :]  # Now logits is just the tensor
     
     # get the probabilities
     probs = F.softmax(next_token_logits, dim=-1) # (B, vocab_size)
