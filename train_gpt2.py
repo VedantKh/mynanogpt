@@ -110,6 +110,7 @@ class GPT(nn.Module):
     
         self.transformer = nn.ModuleDict(dict(
             # thin wrapper around a look up table converting tokens and positions to vectors in the embedding space
+            # wte = word token embeddings, wpe = positional embeddings
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
 
@@ -121,6 +122,20 @@ class GPT(nn.Module):
         ))
         # head to convert the output of the stack of transformer blocks into a sequence of logits of the vocabulary
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0 std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -193,6 +208,7 @@ class GPT(nn.Module):
         return logits, loss
 
 # -------------------------------------------------------
+import tiktoken
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
@@ -215,13 +231,13 @@ class DataLoaderLite:
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)  # targets
-        # advance the position in the tensor
+        # advance the position in the tensor by exactly B*T, wrapping to the beginning if necessary
         self.current_position += B * T
         # if loading the next batch would be out of bounds, reset
         if self.current_position + (B * T + 1) > len(self.tokens):
             self.current_position = 0
         return x, y
-        
+
 # attempt to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
@@ -231,29 +247,20 @@ if torch.cuda.is_available():
 print(f"using device: {device}")
 
 # get a data batch
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000] # only use the first 1000 characters
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-buf = buf.to(device)
-x = buf[:-1].view(B, T) # (B, T)
-y = buf[1:].view(B, T) # (B, T)
+train_loader = DataLoaderLite(B=4, T=32)
 
 # get logits
 # model = GPT.from_pretrained('gpt2') # OR
 model = GPT(GPTConfig())
 model.to(device)
-logits, loss = model(x, y) # model(x)
 
 # alternative to stochastic gradient descent that works better
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 # optimize!
 for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
