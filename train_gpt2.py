@@ -95,11 +95,11 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256
-    vocab_size: int = 65
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
+    block_size: int = 1024 # max sequence length for GPT2
+    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    n_layer: int = 12 # number of transformer layers
+    n_head: int = 12 # number of attention heads
+    n_embd: int = 768 # embedding dimension
 
 # GPT model
 class GPT(nn.Module):
@@ -121,3 +121,4 @@ class GPT(nn.Module):
     ))
     # head to convert the output of the stack of transformer blocks into a sequence of logits of the vocabulary
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
