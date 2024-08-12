@@ -1,2 +1,5 @@
 # ignore myenv
 myenv/
+
+# ignore tiny shakespeare dataset
+input.txt
