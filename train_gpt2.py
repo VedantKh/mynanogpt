@@ -15,6 +15,7 @@ class CausalSelfAttention(nn.Module):
         
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         
         # regularization
         self.n_head = config.n_head
@@ -36,18 +37,22 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         
-        # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # # attention (materializes the large (T,T) matrix for all the queries and keys)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         
-        # autoregressive mask (upper triangular matrix) for decoder block
-        # makes sure tokens only look into the past, not the future
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # # autoregressive mask (upper triangular matrix) for decoder block
+        # # makes sure tokens only look into the past, not the future
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         
-        # normalize the attention weights
-        att = F.softmax(att, dim=-1)
+        # # normalize the attention weights
+        # att = F.softmax(att, dim=-1)
 
-        # data dependent weighted average of values relevant to predicting the next token
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # # data dependent weighted average of values relevant to predicting the next token
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
        
        # output projection
@@ -87,7 +92,8 @@ class Block(nn.Module):
         
         # attention block can be thought of as the communication between vectors (aggregation or pooling function 
         # that tells the model what to focus on when generating each token)
-        x = x + self.attn(self.ln_1(x))
+        x = x + self.attn(self.ln_1(x)) 
+
         # mlp block can be thought of as the computation on the vectors to make sense of the communication
         # allowing each neuron to think individually about the information it has received
         x = x + self.mlp(self.ln_2(x))
@@ -131,7 +137,10 @@ class GPT(nn.Module):
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0 std=0.02)
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -209,6 +218,7 @@ class GPT(nn.Module):
 
 # -------------------------------------------------------
 import tiktoken
+import time
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
@@ -219,7 +229,7 @@ class DataLoaderLite:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
+        self.tokens = torch.tensor(tokens)[:5000]
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
@@ -238,42 +248,48 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
+model = GPT(GPTConfig())
 # attempt to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
-# elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-#     device = "mps"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+model.to(device)
+
+# for gpu, this leads to a huge speed up
+# model = torch.compile(model)
+
 print(f"using device: {device}")
 
 # get a data batch
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=1024)
 
-# get logits
-# model = GPT.from_pretrained('gpt2') # OR
-model = GPT(GPTConfig())
-model.to(device)
+# for gpu, can quantize for speed up
+# torch.set_float32_matmul_precision('high')
 
 # alternative to stochastic gradient descent that works better
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 # optimize!
-for i in range(50):
+for i in range(10):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    # torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # in milliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 print(loss) # should be (B, T, vocab_size)
 import sys; sys.exit(0)
 
-
-
-# time the generation process
-import time
+# -------------------------------------------------------
 start = time.time()
 
 # prefix tokens
