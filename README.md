@@ -8,9 +8,6 @@ MyNanoGPT is a lightweight implementation of the GPT2 architecture that I built 
 - [Installation](#installation)
 - [Usage](#usage)
 - [Training](#training)
-- [Generating Text](#generating-text)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## Features
 

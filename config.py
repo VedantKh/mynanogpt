@@ -7,7 +7,13 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    training_steps: int = 10
+
+    training_steps: int = 1000
+
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 10
+    max_steps = 500
 
 @dataclass
 class DataConfig:
