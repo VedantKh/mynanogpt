@@ -1,2 +1,2 @@
 # mynanogpt
-source myenv/bin/activate :)
+source myenv/bin/activate
