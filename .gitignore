@@ -3,3 +3,9 @@ myenv/
 
 # ignore tiny shakespeare dataset
 input.txt
+
+checkpoints/
+
+__pycache__/
+
+gpt2_model.pth

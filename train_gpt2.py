@@ -4,6 +4,9 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import os
+import tiktoken
+import time
+from config import GPTConfig, DataConfig
 # ---------------------------------------------------
 
 # multi-head attention mechanism
@@ -51,7 +54,8 @@ class CausalSelfAttention(nn.Module):
         # # data dependent weighted average of values relevant to predicting the next token
         # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
-        # flash attention
+        # flash attention replaces the above code by fusing the operations into one kernel
+        # far faster on a gpu
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -99,14 +103,6 @@ class Block(nn.Module):
         # allowing each neuron to think individually about the information it has received
         x = x + self.mlp(self.ln_2(x))
         return x
-
-@dataclass
-class GPTConfig:
-    block_size: int = 1024 # max sequence length for GPT2
-    vocab_size: int = 50304 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 12 # number of transformer layers
-    n_head: int = 12 # number of attention heads
-    n_embd: int = 768 # embedding dimension
 
 # GPT model
 class GPT(nn.Module):
@@ -218,27 +214,47 @@ class GPT(nn.Module):
         return logits, loss
 
 # -------------------------------------------------------
-import tiktoken
-import time
 class DataLoaderLite:
-    def __init__(self, B, T):
-        self.B = B
-        self.T = T
+    def __init__(self, config):
+        self.config = config
+        B, T = config.B, config.T
+        self.dataset = config.dataset_name
 
         # at init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
+        with open(self.dataset, 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # split the data into train, val, and test sets (80%, 10%, 10%)
+        total_tokens = len(tokens)
+        train_size = int(0.8 * total_tokens)
+        val_size = int(0.1 * total_tokens)
+        test_size = total_tokens - train_size - val_size
+
+        self.train_tokens = torch.tensor(tokens[:train_size], dtype=torch.long)
+        self.val_tokens = torch.tensor(tokens[train_size:train_size+val_size], dtype=torch.long)
+        self.test_tokens = torch.tensor(tokens[train_size+val_size:], dtype=torch.long)
+
+        print(f"Train set: {len(self.train_tokens)} tokens")
+        print(f"Validation set: {len(self.val_tokens)} tokens")
+        print(f"Test set: {len(self.test_tokens)} tokens")
+        print(f"1 epoch = {len(self.train_tokens) // (B * T)} batches")
 
         # state
         self.current_position = 0
+        self.current_set = 'train'
 
-    def next_batch(self):
-        B, T = self.B, self.T
+    def next_batch(self, set='train'):
+        B, T = self.config.B, self.config.T
+
+        if set == 'train':
+            self.tokens = self.train_tokens
+        elif set == 'val':
+            self.tokens = self.val_tokens
+        elif set == 'test':
+            self.tokens = self.test_tokens
+
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)  # targets
@@ -249,108 +265,247 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
-model = GPT(GPTConfig())
-# attempt to autodetect the device
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-model.to(device)
+def load_model(config, device, checkpoint_dir, model_path):
+    model = GPT(config)
+    model.to(device)
+    latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
+    if latest_checkpoint:
+        model.load_state_dict(torch.load(latest_checkpoint, map_location=device, weights_only=True))
+        print(f"Model loaded from {latest_checkpoint}")
+    elif os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        print(f"Model loaded from {model_path}")
+    else:
+        print("No pre-trained model found, starting from scratch.")
+    return model
 
-# Load the model if present
-model_path = 'gpt2_model.pth'
-if os.path.exists(model_path):
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    print(f"Model loaded from {model_path}")
-else:
-    print("No pre-trained model found, starting from scratch.")
+def get_latest_checkpoint(checkpoint_dir):
+    checkpoints = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
+    if not checkpoints:
+        return None
+    latest_checkpoint = max(checkpoints, key=os.path.getctime)
+    return latest_checkpoint
 
-# for gpu, this leads to a speed up
-# model = torch.compile(model)
+def train_model(model, train_loader, optimizer, device, checkpoint_dir, model_path):
+    for i in range(model.config.training_steps):
+        t0 = time.time()
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
 
-print(f"using device: {device}")
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        tokens_per_sec = (train_loader.config.B * train_loader.config.T) / (t1 - t0)
+        print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
-# get a data batch
-train_loader = DataLoaderLite(B=24, T=1024)
+        if (i + 1) % 100 == 0:
+            save_checkpoint(model, checkpoint_dir, i + 1)
 
-# for gpu, can quantize for speed up
-torch.set_float32_matmul_precision('high')
+    torch.save(model.state_dict(), model_path)
+    print(f"Model saved to {model_path}")
 
-# alternative to stochastic gradient descent that works better
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+def save_checkpoint(model, checkpoint_dir, step):
+    checkpoint_path = os.path.join(checkpoint_dir, f'model_step_{step}.pth')
+    torch.save(model.state_dict(), checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
 
-# optimize!
-for i in range(1000):
-    t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    logits, loss = model(x, y)
-    loss.backward()
-    optimizer.step()
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = (t1 - t0)*1000 # in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+def generate_text(model, device, prompt, num_return_sequences=5, max_length=30):
+    model.eval()
+    enc = tiktoken.get_encoding('gpt2')
+    tokens = enc.encode(prompt)
+    tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).repeat(num_return_sequences, 1)
+    tokens = tokens.to(device)
 
-# Save the model
-torch.save(model.state_dict(), model_path)
-print(f"Model saved to {model_path}")
+    while tokens.size(1) < max_length:
+        with torch.no_grad():
+            logits, _ = model(tokens)
+            next_token_logits = logits[:, -1, :]
+        probs = F.softmax(next_token_logits, dim=-1)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        ix = torch.multinomial(topk_probs, num_samples=1)
+        xcol = torch.gather(topk_indices, -1, ix)
+        tokens = torch.cat((tokens, xcol), dim=1)
 
-print(loss) # should be (B, T, vocab_size)
-# import sys; sys.exit(0)
+    for i in range(num_return_sequences):
+        decoded = enc.decode(tokens[i, :max_length].tolist())
+        print(">", decoded)
 
-# -------------------------------------------------------
-start = time.time()
+def main():
+    # Configuration
+    config = GPTConfig()
 
-# prefix tokens
-model.eval()
-num_return_sequences = 5
-max_length = 30
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
 
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode('First')
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-x = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-# x = x.to('cuda')
-print(x.shape)
+    checkpoint_dir = 'checkpoints'
+    model_path = 'gpt2_model.pth'
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-x = x.to('cuda')
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits, _ = model(x)  # Unpack the tuple to get logits
-        next_token_logits = logits[:, -1, :].to('cuda')  # Now logits is just the tensor
+    # Load model
+    model = load_model(config, device, checkpoint_dir, model_path)
+
+    # Data loader
+    train_loader = DataLoaderLite(DataConfig())
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    # Train model
+    train_model(model, train_loader, optimizer, device, checkpoint_dir, model_path)
+
+    # Generate text
+    generate_text(model, device, prompt='First')
+
+if __name__ == "__main__":
+    main()
+
+# model = GPT(GPTConfig())
+# # attempt to autodetect the device
+# device = "cpu"
+# if torch.cuda.is_available():
+#     device = "cuda"
+# elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+#     device = "mps"
+# model.to(device)
+
+# # Load the model if present
+# model_path = 'gpt2_model.pth'
+# checkpoint_dir = 'checkpoints'
+
+# # Ensure the checkpoint directory exists before accessing it
+# os.makedirs(checkpoint_dir, exist_ok=True)
+
+# def get_latest_checkpoint(checkpoint_dir):
+#     checkpoints = [os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
+#     if not checkpoints:
+#         return None
+#     latest_checkpoint = max(checkpoints, key=os.path.getctime)
+#     return latest_checkpoint
+
+# latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
+# if latest_checkpoint:
+#     model.load_state_dict(torch.load(latest_checkpoint, map_location=device))
+#     print(f"Model loaded from {latest_checkpoint}")
+# elif os.path.exists(model_path):
+#     model.load_state_dict(torch.load(model_path, map_location=device))
+#     print(f"Model loaded from {model_path}")
+# else:
+#     print("No pre-trained model found, starting from scratch.")
+
+# # for gpu, this leads to a speed up
+# # model = torch.compile(model)
+
+# print(f"using device: {device}")
+
+# # get a data batch
+# train_loader = DataLoaderLite(DataConfig())
+
+# # for gpu, can quantize for speed up
+# torch.set_float32_matmul_precision('high')
+
+# # alternative to stochastic gradient descent that works better
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+# # optimize!
+# checkpoint_dir = 'checkpoints'
+# os.makedirs(checkpoint_dir, exist_ok=True)
+# checkpoint_list = []
+
+# for i in range(model.config.training_steps):
+#     t0 = time.time()
+#     x, y = train_loader.next_batch()
+#     x, y = x.to(device), y.to(device)
+#     optimizer.zero_grad()
+#     logits, loss = model(x, y)
+#     loss.backward()
+#     optimizer.step()
+
+#     # if cuda available, synchronize for accurate timing
+#     if device == 'cuda':
+#         torch.cuda.synchronize()
+#     t1 = time.time()
+#     dt = (t1 - t0)*1000 # in milliseconds
+#     tokens_per_sec = (train_loader.config.B * train_loader.config.T) / (t1 - t0)
+#     print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+
+#     # Save checkpoint every 100 steps
+#     if (i + 1) % 100 == 0:
+#         checkpoint_path = os.path.join(checkpoint_dir, f'model_step_{i+1}.pth')
+#         torch.save(model.state_dict(), checkpoint_path)
+#         checkpoint_list.append(checkpoint_path)
+#         print(f"Checkpoint saved to {checkpoint_path}")
+
+#         # Maintain only the 10 most recent checkpoints
+#         if len(checkpoint_list) > 10:
+#             oldest_checkpoint = checkpoint_list.pop(0)
+#             os.remove(oldest_checkpoint)
+#             print(f"Deleted old checkpoint {oldest_checkpoint}")
+
+# # Save the final model
+# torch.save(model.state_dict(), model_path)
+# print(f"Model saved to {model_path}")
+
+# print(loss) # should be (B, T, vocab_size)
+# # import sys; sys.exit(0)
+
+# # -------------------------------------------------------
+# start = time.time()
+
+# # prefix tokens
+# model.eval()
+# num_return_sequences = 5
+# max_length = 30
+
+# enc = tiktoken.get_encoding('gpt2')
+# tokens = enc.encode('First')
+# tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+# x = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+# # x = x.to('cuda')
+# print(x.shape)
+
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+# x = x.to(device)
+
+# while x.size(1) < max_length:
+#     # forward the model to get the logits
+#     with torch.no_grad():
+#         logits, _ = model(x)  # Unpack the tuple to get logits
+#         next_token_logits = logits[:, -1, :].to(device)  # Now logits is just the tensor
     
-    # get the probabilities
-    probs = F.softmax(next_token_logits, dim=-1).to('cuda') # (B, vocab_size)
+#     # get the probabilities
+#     probs = F.softmax(next_token_logits, dim=-1).to(device) # (B, vocab_size)
     
-    # do top-k sampling of 50 (huggingface pipeline default)
-    # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#     # do top-k sampling of 50 (huggingface pipeline default)
+#     # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+#     topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
     
-    # sample from the top-k probabilities
-    ix = torch.multinomial(topk_probs, num_samples=1).to('cuda') # (B, 1)
+#     # sample from the top-k probabilities
+#     ix = torch.multinomial(topk_probs, num_samples=1).to(device) # (B, 1)
     
-    # gather the token indices
-    xcol = torch.gather(topk_indices, -1, ix).to('cuda') # (B, 1)
+#     # gather the token indices
+#     xcol = torch.gather(topk_indices, -1, ix).to(device) # (B, 1)
     
-    # append to the sequence
-    x = torch.cat((x, xcol), dim=1).to('cuda') # (B, T+1)
+#     # append to the sequence
+#     x = torch.cat((x, xcol), dim=1).to(device) # (B, T+1)
 
 
-# print the generated text
-for i in range(num_return_sequences):
-    # convert the token indices to text
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
+# # print the generated text
+# for i in range(num_return_sequences):
+#     # convert the token indices to text
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
 
-    print(">", decoded)
+#     print(">", decoded)
 
-end = time.time()
-print(f"generation took: {end - start:.4f} seconds")
-print(f"avg = {(end - start) / num_return_sequences:.4f} seconds")
+# end = time.time()
+# print(f"generation took: {end - start:.4f} seconds")
+# print(f"avg = {(end - start) / num_return_sequences:.4f} seconds")
