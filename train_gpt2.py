@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import os
 # ---------------------------------------------------
 
 # multi-head attention mechanism
@@ -102,7 +103,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length for GPT2
-    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    vocab_size: int = 50304 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of transformer layers
     n_head: int = 12 # number of attention heads
     n_embd: int = 768 # embedding dimension
@@ -229,7 +230,7 @@ class DataLoaderLite:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)[:5000]
+        self.tokens = torch.tensor(tokens)
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
@@ -257,22 +258,30 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 model.to(device)
 
-# for gpu, this leads to a huge speed up
+# Load the model if present
+model_path = 'gpt2_model.pth'
+if os.path.exists(model_path):
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    print(f"Model loaded from {model_path}")
+else:
+    print("No pre-trained model found, starting from scratch.")
+
+# for gpu, this leads to a speed up
 # model = torch.compile(model)
 
 print(f"using device: {device}")
 
 # get a data batch
-train_loader = DataLoaderLite(B=4, T=1024)
+train_loader = DataLoaderLite(B=24, T=1024)
 
 # for gpu, can quantize for speed up
-# torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('high')
 
 # alternative to stochastic gradient descent that works better
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 # optimize!
-for i in range(10):
+for i in range(1000):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -280,14 +289,18 @@ for i in range(10):
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    # torch.cuda.synchronize()
+    torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000 # in milliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
     print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
+# Save the model
+torch.save(model.state_dict(), model_path)
+print(f"Model saved to {model_path}")
+
 print(loss) # should be (B, T, vocab_size)
-import sys; sys.exit(0)
+# import sys; sys.exit(0)
 
 # -------------------------------------------------------
 start = time.time()
@@ -305,28 +318,29 @@ x = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
 print(x.shape)
 
 torch.manual_seed(42)
-# torch.cuda.manual_seed(42)
+torch.cuda.manual_seed(42)
+x = x.to('cuda')
 while x.size(1) < max_length:
     # forward the model to get the logits
     with torch.no_grad():
         logits, _ = model(x)  # Unpack the tuple to get logits
-        next_token_logits = logits[:, -1, :]  # Now logits is just the tensor
+        next_token_logits = logits[:, -1, :].to('cuda')  # Now logits is just the tensor
     
     # get the probabilities
-    probs = F.softmax(next_token_logits, dim=-1) # (B, vocab_size)
+    probs = F.softmax(next_token_logits, dim=-1).to('cuda') # (B, vocab_size)
     
     # do top-k sampling of 50 (huggingface pipeline default)
     # topk_probs here becomes (5, 50), topk_indices is (5, 50)
     topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
     
     # sample from the top-k probabilities
-    ix = torch.multinomial(topk_probs, num_samples=1) # (B, 1)
+    ix = torch.multinomial(topk_probs, num_samples=1).to('cuda') # (B, 1)
     
     # gather the token indices
-    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+    xcol = torch.gather(topk_indices, -1, ix).to('cuda') # (B, 1)
     
     # append to the sequence
-    x = torch.cat((x, xcol), dim=1) # (B, T+1)
+    x = torch.cat((x, xcol), dim=1).to('cuda') # (B, T+1)
 
 
 # print the generated text

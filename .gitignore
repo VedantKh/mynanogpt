@@ -3,3 +3,6 @@ myenv/
 
 # ignore tiny shakespeare dataset
 input.txt
+
+# ignore gpt2_model
+gpt2_model.pth
